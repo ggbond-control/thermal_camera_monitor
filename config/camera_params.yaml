@@ -1,0 +1,9 @@
+hik_alarm_node:
+  ros__parameters:
+    device_ip: "192.168.2.64"
+    device_port: 8000
+    username: "admin"
+    password: "FHZNfhzn"
+    login_mode: 0
+    sdk_log_enable: true
+    sdk_log_dir: "/tmp/hik_sdk_log"
