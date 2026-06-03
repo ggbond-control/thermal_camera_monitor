@@ -7,3 +7,4 @@ hik_alarm_node:
     login_mode: 0
     sdk_log_enable: true
     sdk_log_dir: "/tmp/hik_sdk_log"
+    save_pic_dir: "alarms"

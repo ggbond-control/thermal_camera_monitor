@@ -10,14 +10,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(monitor_interfaces REQUIRED)
 
 set(HIK_SDK_ROOT_ARM "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hik_sdk/arm64")
 set(HIK_SDK_ROOT_X64 "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hik_sdk/x64")
 
 add_executable(hik_alarm_node src/hik_alarm_node.cpp)
-ament_target_dependencies(hik_alarm_node rclcpp std_msgs monitor_interfaces)
+ament_target_dependencies(hik_alarm_node rclcpp rclcpp_action ament_index_cpp std_msgs diagnostic_msgs monitor_interfaces)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   set(HIK_SDK_INC_DIR "${HIK_SDK_ROOT_ARM}/include")
