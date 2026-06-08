@@ -13,6 +13,7 @@ find_package(rclcpp REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(CURL REQUIRED)
 
 set(HIK_SDK_ROOT_ARM "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hik_sdk/arm64")
 set(HIK_SDK_ROOT_X64 "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hik_sdk/x64")
@@ -49,6 +50,8 @@ if(HIK_SDK_LIB_DIR)
     INSTALL_RPATH "${HIK_SDK_LIB_DIR};${HIK_SDK_LIB_DIR}/HCNetSDKCom"
   )
 endif()
+
+target_link_libraries(hik_alarm_node CURL::libcurl)
 
 install(TARGETS hik_alarm_node
   DESTINATION lib/${PROJECT_NAME}

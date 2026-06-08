@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <curl/curl.h>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
@@ -10,6 +11,8 @@
 #include <functional>
 #include <iomanip>
 #include <mutex>
+#include <optional>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -53,7 +56,15 @@ public:
         sdk_log_enable_ = declare_parameter<bool>("sdk_log_enable", true);
         sdk_log_dir_ = declare_parameter<std::string>("sdk_log_dir", "/tmp/hik_sdk_log");
         save_pic_dir_ = declare_parameter<std::string>("save_pic_dir", "alarms");
-        test_alarm_hold_seconds_ = declare_parameter<int>("test_alarm_hold_seconds", 5);
+        test_alarm_hold_seconds_ = declare_parameter<int>("test_alarm_hold_seconds", 1);
+        thermometry_channel_ = declare_parameter<int>("thermometry_channel", 1);
+        const auto thermometry_http_channels_raw = declare_parameter<std::vector<int64_t>>("thermometry_http_channels", {2, 1});
+        http_poll_interval_ms_ = declare_parameter<int>("http_poll_interval_ms", 1000);
+
+        for (const auto channel : thermometry_http_channels_raw)
+            thermometry_http_channels_.push_back(static_cast<int>(channel));
+        if (std::find(thermometry_http_channels_.begin(), thermometry_http_channels_.end(), thermometry_channel_) == thermometry_http_channels_.end())
+            thermometry_http_channels_.insert(thermometry_http_channels_.begin(), thermometry_channel_);
 
         const auto pkg_share = ament_index_cpp::get_package_share_directory("thermal_camera_monitor");
         save_pic_dir_ = resolve_save_dir(pkg_share, save_pic_dir_);
@@ -158,6 +169,7 @@ private:
         }
 
         publish_status(diagnostic_msgs::msg::DiagnosticStatus::ERROR, "热成像相机测试报警");
+        RCLCPP_ERROR(get_logger(), "[海康] 已触发测试报警：level=ERROR(2) 持续=%d秒", std::max(1, test_alarm_hold_seconds_));
         response->success = true;
         response->message = "已触发热成像相机测试报警";
     }
@@ -175,6 +187,42 @@ private:
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(2) << value;
         return oss.str();
+    }
+
+    static std::string preview_hex(const char *data, size_t length, size_t max_bytes = 16)
+    {
+        if (data == nullptr || length == 0)
+            return "";
+        std::ostringstream oss;
+        const size_t count = std::min(length, max_bytes);
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (i)
+                oss << ' ';
+            oss << std::uppercase << std::hex << std::setw(2) << std::setfill('0')
+                << static_cast<int>(static_cast<unsigned char>(data[i]));
+        }
+        return oss.str();
+    }
+
+    static std::string trim_for_log(const std::string &text, size_t max_chars = 240)
+    {
+        if (text.size() <= max_chars)
+            return text;
+        return text.substr(0, max_chars) + "...";
+    }
+
+    static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+    {
+        const size_t total_size = size * nmemb;
+        auto *buffer = reinterpret_cast<CurlResponseBuffer *>(userp);
+        buffer->payload.append(reinterpret_cast<const char *>(contents), total_size);
+        if (extract_json_object(buffer->payload).has_value())
+        {
+            buffer->completed = true;
+            return 0;
+        }
+        return total_size;
     }
 
     static std::string resolve_save_dir(const std::string &pkg_share, const std::string &param_path)
@@ -207,6 +255,16 @@ private:
         latest_alarm_type_.clear();
         latest_alarm_detail_.clear();
         latest_status_level_ = diagnostic_msgs::msg::DiagnosticStatus::OK;
+        realtime_thermometry_valid_ = false;
+        realtime_temperature_c_ = 0.0F;
+        realtime_max_temperature_c_ = 0.0F;
+        realtime_min_temperature_c_ = 0.0F;
+        realtime_avg_temperature_c_ = 0.0F;
+        realtime_temperature_diff_c_ = 0.0F;
+        realtime_rule_name_.clear();
+        realtime_rule_id_ = 0;
+        realtime_calib_type_ = 0;
+        realtime_error_.clear();
         manual_test_alarm_until_ = std::chrono::steady_clock::time_point{};
     }
 
@@ -238,9 +296,24 @@ private:
         values.push_back(kv("device_port", std::to_string(device_port_)));
         values.push_back(kv("login_mode", std::to_string(login_mode_)));
         values.push_back(kv("save_pic_dir", save_pic_dir_));
+        values.push_back(kv("thermometry_channel", std::to_string(thermometry_channel_)));
+        values.push_back(kv("http_thermometry_channel", active_http_thermometry_channel_ >= 0 ? std::to_string(active_http_thermometry_channel_) : ""));
         values.push_back(kv("alarm_active", latest_alarm_active_ ? "true" : "false"));
         values.push_back(kv("alarm_type", latest_alarm_type_));
         values.push_back(kv("alarm_detail", latest_alarm_detail_));
+        values.push_back(kv("realtime_valid", realtime_thermometry_valid_ ? "true" : "false"));
+        values.push_back(kv("realtime_error", realtime_error_));
+        if (realtime_thermometry_valid_)
+        {
+            values.push_back(kv("temperature_c", number(realtime_temperature_c_)));
+            values.push_back(kv("max_temperature_c", number(realtime_max_temperature_c_)));
+            values.push_back(kv("min_temperature_c", number(realtime_min_temperature_c_)));
+            values.push_back(kv("avg_temperature_c", number(realtime_avg_temperature_c_)));
+            values.push_back(kv("temperature_diff_c", number(realtime_temperature_diff_c_)));
+            values.push_back(kv("realtime_rule_name", realtime_rule_name_));
+            values.push_back(kv("realtime_rule_id", std::to_string(realtime_rule_id_)));
+            values.push_back(kv("realtime_calib_type", std::to_string(realtime_calib_type_)));
+        }
         values.push_back(kv("artifact_count", std::to_string(latest_artifacts_.size())));
         for (size_t i = 0; i < latest_artifacts_.size(); ++i)
             values.push_back(kv("artifact_path_" + std::to_string(i), latest_artifacts_[i]));
@@ -378,15 +451,6 @@ private:
         return diagnostic_msgs::msg::DiagnosticStatus::WARN;
     }
 
-    static std::string diagnostic_message_from_alarm_level(BYTE alarm_level)
-    {
-        if (alarm_level == 0)
-            return "热成像预警";
-        if (alarm_level == 1)
-            return "热成像报警";
-        return "热成像异常";
-    }
-
     static std::string status_message_for_alarm(const std::string &alarm_type, uint8_t status_level)
     {
         const bool is_alarm = status_level == diagnostic_msgs::msg::DiagnosticStatus::ERROR;
@@ -401,6 +465,48 @@ private:
         if (alarm_type == "thermal_camera_test_alarm")
             return "热成像测试报警";
         return is_alarm ? "热成像报警" : "热成像预警";
+    }
+
+    static std::optional<std::string> extract_json_object(const std::string &payload)
+    {
+        const auto begin = payload.find('{');
+        const auto end = payload.rfind('}');
+        if (begin == std::string::npos || end == std::string::npos || end <= begin)
+            return std::nullopt;
+        return payload.substr(begin, end - begin + 1);
+    }
+
+    struct CurlResponseBuffer
+    {
+        std::string payload;
+        bool completed{false};
+    };
+
+    static std::optional<float> extract_json_float(const std::string &json, const std::string &key)
+    {
+        const std::regex pattern("\"" + key + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
+        std::smatch match;
+        if (!std::regex_search(json, match, pattern))
+            return std::nullopt;
+        return std::stof(match[1].str());
+    }
+
+    static std::optional<int> extract_json_int(const std::string &json, const std::string &key)
+    {
+        const std::regex pattern("\"" + key + "\"\\s*:\\s*(-?[0-9]+)");
+        std::smatch match;
+        if (!std::regex_search(json, match, pattern))
+            return std::nullopt;
+        return std::stoi(match[1].str());
+    }
+
+    static std::optional<std::string> extract_json_string(const std::string &json, const std::string &key)
+    {
+        const std::regex pattern("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+        std::smatch match;
+        if (!std::regex_search(json, match, pattern))
+            return std::nullopt;
+        return match[1].str();
     }
 
     std::string masked_password() const
@@ -428,10 +534,10 @@ private:
 
             if (lCommand == 0x4012)
             {
-                const std::string raw(pAlarmInfo, pAlarmInfo + dwBufLen);
-                latest_values_.push_back(kv("raw_summary", raw.substr(0, std::min<size_t>(raw.size(), 256))));
-                latest_alarm_detail_ = raw.substr(0, std::min<size_t>(raw.size(), 256));
-                message = "收到热成像原始事件";
+                latest_values_.push_back(kv("raw_length", std::to_string(dwBufLen)));
+                latest_values_.push_back(kv("raw_preview_hex", preview_hex(pAlarmInfo, dwBufLen)));
+                latest_alarm_detail_ = "热成像原始事件";
+                message = "热成像原始事件";
             }
             else if (lCommand == COMM_THERMOMETRY_ALARM)
             {
@@ -574,6 +680,174 @@ private:
             reinterpret_cast<HikAlarmNode *>(pUser)->on_alarm(lCommand, pAlarmInfo, dwBufLen);
     }
 
+    void update_realtime_thermometry_locked(float max_temperature,
+                                            float min_temperature,
+                                            float average_temperature,
+                                            float temperature_diff)
+    {
+        realtime_thermometry_valid_ = true;
+        realtime_rule_id_ = 0;
+        realtime_rule_name_ = "http_realtime_thermometry";
+        realtime_calib_type_ = 2;
+        realtime_temperature_c_ = average_temperature;
+        realtime_max_temperature_c_ = max_temperature;
+        realtime_min_temperature_c_ = min_temperature;
+        realtime_avg_temperature_c_ = average_temperature;
+        realtime_temperature_diff_c_ = temperature_diff;
+    }
+
+    void invalidate_realtime_thermometry_locked()
+    {
+        realtime_thermometry_valid_ = false;
+        realtime_temperature_c_ = 0.0F;
+        realtime_max_temperature_c_ = 0.0F;
+        realtime_min_temperature_c_ = 0.0F;
+        realtime_avg_temperature_c_ = 0.0F;
+        realtime_temperature_diff_c_ = 0.0F;
+        realtime_rule_name_.clear();
+        realtime_rule_id_ = 0;
+        realtime_calib_type_ = 0;
+    }
+
+    bool fetch_http_thermometry_for_channel(int channel, std::string &payload, long &http_code, std::string &error_message) const
+    {
+        CURL *curl = curl_easy_init();
+        if (curl == nullptr)
+        {
+            error_message = "curl_easy_init failed";
+            return false;
+        }
+
+        CurlResponseBuffer response_body;
+        const std::string url = "http://" + device_ip_ + "/ISAPI/Thermal/channels/" + std::to_string(channel) + "/thermometry/realTimethermometry/rules?format=json";
+        const std::string auth = username_ + ":" + password_;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
+        curl_easy_setopt(curl, CURLOPT_USERPWD, auth.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+
+        const CURLcode curl_code = curl_easy_perform(curl);
+        if (curl_code != CURLE_OK && !(curl_code == CURLE_WRITE_ERROR && response_body.completed))
+        {
+            error_message = curl_easy_strerror(curl_code);
+            curl_easy_cleanup(curl);
+            return false;
+        }
+
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_cleanup(curl);
+        payload = std::move(response_body.payload);
+        return true;
+    }
+
+    bool parse_http_thermometry_payload(const std::string &payload, std::string &error_message)
+    {
+        const auto json_opt = extract_json_object(payload);
+        if (!json_opt.has_value())
+        {
+            error_message = "response does not contain JSON";
+            return false;
+        }
+        const std::string &json = json_opt.value();
+
+        const auto sub_status = extract_json_string(json, "subStatusCode");
+        if (sub_status.has_value() && sub_status.value() == "notSupport")
+        {
+            error_message = "notSupport";
+            return false;
+        }
+
+        const auto max_temperature = extract_json_float(json, "MaxTemperature");
+        const auto min_temperature = extract_json_float(json, "MinTemperature");
+        const auto average_temperature = extract_json_float(json, "AverageTemperature");
+        const auto temperature_diff = extract_json_float(json, "TemperatureDiff");
+
+        if (!max_temperature.has_value() || !min_temperature.has_value() || !average_temperature.has_value() || !temperature_diff.has_value())
+        {
+            error_message = "temperature fields missing";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        update_realtime_thermometry_locked(max_temperature.value(), min_temperature.value(), average_temperature.value(), temperature_diff.value());
+        return true;
+    }
+
+    bool discover_http_thermometry_channel()
+    {
+        for (const int channel : thermometry_http_channels_)
+        {
+            std::string payload;
+            std::string error_message;
+            long http_code = 0;
+            if (!fetch_http_thermometry_for_channel(channel, payload, http_code, error_message))
+            {
+                RCLCPP_WARN(get_logger(), "[海康] HTTP实时测温探测失败：channel=%d error=%s", channel, error_message.c_str());
+                continue;
+            }
+            if (http_code != 200)
+            {
+                RCLCPP_WARN(get_logger(), "[海康] HTTP实时测温探测失败：channel=%d http_code=%ld body=%s",
+                            channel, http_code, trim_for_log(payload).c_str());
+                continue;
+            }
+            if (!parse_http_thermometry_payload(payload, error_message))
+            {
+                RCLCPP_WARN(get_logger(), "[海康] HTTP实时测温探测失败：channel=%d parse_error=%s body=%s",
+                            channel, error_message.c_str(), trim_for_log(payload).c_str());
+                continue;
+            }
+
+            active_http_thermometry_channel_ = channel;
+            RCLCPP_INFO(get_logger(), "[海康] 已启用 HTTP 实时测温通道：channel=%d", channel);
+            return true;
+        }
+        return false;
+    }
+
+    bool query_http_realtime_thermometry()
+    {
+        if (active_http_thermometry_channel_ < 0 && !discover_http_thermometry_channel())
+            return false;
+
+        std::string payload;
+        std::string error_message;
+        long http_code = 0;
+        if (!fetch_http_thermometry_for_channel(active_http_thermometry_channel_, payload, http_code, error_message))
+        {
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            realtime_error_ = error_message;
+            return false;
+        }
+
+        if (http_code != 200)
+        {
+            error_message = "HTTP " + std::to_string(http_code);
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            realtime_error_ = error_message;
+            return false;
+        }
+
+        if (!parse_http_thermometry_payload(payload, error_message))
+        {
+            if (error_message == "notSupport")
+                active_http_thermometry_channel_ = -1;
+            std::lock_guard<std::mutex> lock(status_mutex_);
+            realtime_error_ = error_message;
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        realtime_error_.clear();
+        return true;
+    }
+
     bool establish_session(std::string &message)
     {
         RCLCPP_INFO(get_logger(), "[海康] 启动配置：地址=%s 端口=%d 用户=%s 密码=%s 登录模式=%d SDK日志=%s",
@@ -666,6 +940,37 @@ private:
     {
         while (rclcpp::ok() && monitoring_active_)
         {
+            if (!query_http_realtime_thermometry())
+            {
+                std::string realtime_error;
+                {
+                    std::lock_guard<std::mutex> lock(status_mutex_);
+                    invalidate_realtime_thermometry_locked();
+                    realtime_error = realtime_error_;
+                }
+                RCLCPP_WARN(get_logger(), "HTTP实时测温未获取到有效数据：%s", realtime_error.c_str());
+            }
+            else
+            {
+                float avg_temperature = 0.0F;
+                float max_temperature = 0.0F;
+                float min_temperature = 0.0F;
+                float temperature_diff = 0.0F;
+                int http_channel = -1;
+                {
+                    std::lock_guard<std::mutex> lock(status_mutex_);
+                    avg_temperature = realtime_avg_temperature_c_;
+                    max_temperature = realtime_max_temperature_c_;
+                    min_temperature = realtime_min_temperature_c_;
+                    temperature_diff = realtime_temperature_diff_c_;
+                    http_channel = active_http_thermometry_channel_;
+                }
+                RCLCPP_INFO(
+                    get_logger(),
+                    "[海康] 实时测温：channel=%d 平均=%.1f°C 最高=%.1f°C 最低=%.1f°C 温差=%.1f°C",
+                    http_channel, avg_temperature, max_temperature, min_temperature, temperature_diff);
+            }
+
             bool alarm_active = false;
             std::string alarm_type;
             uint8_t status_level = diagnostic_msgs::msg::DiagnosticStatus::OK;
@@ -678,7 +983,7 @@ private:
             }
             publish_status(alarm_active ? status_level : diagnostic_msgs::msg::DiagnosticStatus::OK,
                            alarm_active ? status_message_for_alarm(alarm_type, status_level) : "热成像相机运行中");
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(200, http_poll_interval_ms_)));
         }
 
         cleanup();
@@ -724,6 +1029,10 @@ private:
     std::string sdk_log_dir_;
     std::string save_pic_dir_;
     int test_alarm_hold_seconds_{};
+    int thermometry_channel_{};
+    int http_poll_interval_ms_{};
+    std::vector<int> thermometry_http_channels_;
+    int active_http_thermometry_channel_{-1};
 
     std::atomic<bool> monitoring_active_{false};
     std::thread worker_;
@@ -740,6 +1049,16 @@ private:
     std::string latest_alarm_type_;
     std::string latest_alarm_detail_;
     uint8_t latest_status_level_{diagnostic_msgs::msg::DiagnosticStatus::OK};
+    bool realtime_thermometry_valid_{false};
+    float realtime_temperature_c_{0.0F};
+    float realtime_max_temperature_c_{0.0F};
+    float realtime_min_temperature_c_{0.0F};
+    float realtime_avg_temperature_c_{0.0F};
+    float realtime_temperature_diff_c_{0.0F};
+    std::string realtime_rule_name_;
+    std::string realtime_error_;
+    uint8_t realtime_rule_id_{0};
+    uint8_t realtime_calib_type_{0};
     std::chrono::steady_clock::time_point manual_test_alarm_until_{};
 
 #ifdef USE_HIK_SDK
@@ -750,9 +1069,11 @@ private:
 
 int main(int argc, char **argv)
 {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     rclcpp::init(argc, argv);
     auto node = std::make_shared<HikAlarmNode>();
     rclcpp::spin(node);
     rclcpp::shutdown();
+    curl_global_cleanup();
     return 0;
 }
