@@ -8,3 +8,5 @@ hik_alarm_node:
     sdk_log_enable: true
     sdk_log_dir: "/tmp/hik_sdk_log"
     save_pic_dir: "alarms"
+    thermometry_channel: 1
+    realtime_poll_interval_ms: 1000

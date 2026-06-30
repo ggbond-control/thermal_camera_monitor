@@ -3,14 +3,14 @@
 ## 编译
 
 ```bash
-cd ~/Workspace/algor_ws
+cd ~/Workspace/task_ws
 colcon build --packages-select thermal_camera_monitor --symlink-install
 ```
 
 ## 启动
 
 ```bash
-source ~/Workspace/algor_ws/install/setup.zsh
+source ~/Workspace/task_ws/install/setup.zsh
 ros2 launch thermal_camera_monitor thermal_camera_monitor.launch.py
 
 ros2 service call /monitor/thermal_camera/start std_srvs/srv/Trigger "{}"
@@ -45,13 +45,13 @@ values:
   - {key: device_ip, : 192.168.2.64}
   - {key: device_port, : '8000'}
   - {key: login_mode, : '0'}
-  - {key: save_pic_dir, : /home/cat/Workspace/algor_ws/src/thermal_camera_monitor/alarms}
+  - {key: save_pic_dir, : /home/cat/Workspace/task_ws/src/thermal_camera_monitor/alarms}
   - {key: alarm_active, : 'true'}
   - {key: alarm_type, : thermal_alarm}
   - {key: alarm_detail, : 测温报警}
   - {key: artifact_count, : '2'}
-  - {key: artifact_path_0, : /home/cat/Workspace/algor_ws/src/thermal_camera_monitor/alarms/visible_20260604_164410.jpg}
-  - {key: artifact_path_1, : /home/cat/Workspace/algor_ws/src/thermal_camera_monitor/alarms/thermal_20260604_164410.jpg}
+  - {key: artifact_path_0, : /home/cat/Workspace/task_ws/src/thermal_camera_monitor/alarms/visible_20260604_164410.jpg}
+  - {key: artifact_path_1, : /home/cat/Workspace/task_ws/src/thermal_camera_monitor/alarms/thermal_20260604_164410.jpg}
   - {key: command, : '21010'}
   - {key: temperature_c, : '38.10'}
   - {key: alarm_level, : '1'}
