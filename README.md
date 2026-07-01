@@ -15,6 +15,7 @@ ros2 launch thermal_camera_monitor thermal_camera_monitor.launch.py
 
 ros2 service call /monitor/thermal_camera/start std_srvs/srv/Trigger "{}"
 ros2 topic echo /monitor/thermal_camera/status | grep -E "(level|name|message|hardware_id)"
+ros2 topic echo /monitor/thermal_camera/heatmap --once
 ros2 service call /monitor/thermal_camera/stop std_srvs/srv/Trigger "{}"
 ```
 
@@ -32,6 +33,7 @@ ros2 service call /monitor/thermal_camera/test_alarm std_srvs/srv/Trigger "{}"
 | `/monitor/thermal_camera/stop`       | `std_srvs/srv/Trigger`                 |
 | `/monitor/thermal_camera/status`     | `diagnostic_msgs/msg/DiagnosticStatus` |
 | `/monitor/thermal_camera/test_alarm` | `std_srvs/srv/Trigger`                 |
+| `/monitor/thermal_camera/heatmap`    | `sensor_msgs/msg/Image`                |
 
 `/monitor/thermal_camera/status`示例：
 
@@ -61,6 +63,26 @@ values:
   - {key: alarm_rule_name, : 大于}
   - {key: rule_temperature_c, : '35.00'}
   - {key: alarm_rule_temperature_c, : '35.00'}
+```
+
+`/monitor/thermal_camera/heatmap`示例：
+
+```text
+header:
+  stamp:
+    sec: 1782883234
+    nanosec: 744547847
+  frame_id: ''
+height: 192
+width: 256
+encoding: bgr8
+is_bigendian: 0
+step: 768
+data:
+- 0
+- 255
+- 255
+- '...'
 ```
 
 ## 排错

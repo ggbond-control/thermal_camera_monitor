@@ -1,23 +1,31 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "diagnostic_msgs/msg/diagnostic_status.hpp"
 #include "diagnostic_msgs/msg/key_value.hpp"
+#include "sensor_msgs/msg/image.hpp"
+#include "opencv2/imgcodecs.hpp"
+#include "opencv2/imgproc.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
@@ -40,6 +48,77 @@
 #endif
 #endif
 
+namespace
+{
+    struct TemperatureGridStats
+    {
+        float min_temperature{0.0F};
+        float max_temperature{0.0F};
+        float avg_temperature{0.0F};
+    };
+
+    struct ParsedHeatmapFrame
+    {
+        int width{0};
+        int height{0};
+        bool freeze_data{false};
+        std::vector<float> temperatures;
+        std::string source_format;
+    };
+
+#pragma pack(push, 1)
+    struct HikDateTime
+    {
+        uint16_t year;
+        uint16_t month;
+        uint16_t day_of_week;
+        uint16_t day;
+        uint16_t hour;
+        uint16_t minute;
+        uint16_t second;
+        uint16_t millisecond;
+    };
+
+    struct StreamRtDataInfoTemp
+    {
+        uint32_t rt_data_type;
+        uint32_t frame_num;
+        uint32_t std_stamp;
+        HikDateTime time;
+        uint32_t width;
+        uint32_t height;
+        uint32_t length;
+        uint32_t fps;
+        uint32_t channel;
+    };
+
+    struct StreamFsSuppleInfoTemp
+    {
+        uint32_t tm_data_mode;
+        uint32_t tm_scale;
+        uint32_t tm_offset;
+        uint32_t freeze_data;
+    };
+
+    struct StreamFrameInfoTemp
+    {
+        uint32_t magic_no;
+        uint32_t header_size;
+        uint32_t stream_type;
+        uint32_t stream_len;
+        StreamRtDataInfoTemp rt_info;
+        StreamFsSuppleInfoTemp supplementary;
+        uint32_t reserved[12];
+        uint32_t crc;
+    };
+#pragma pack(pop)
+
+    constexpr uint32_t kFullScreenThermometryResultType = 2;
+    constexpr size_t kHeatmapJpegBufferSize = 8U * 1024U * 1024U;
+    constexpr size_t kHeatmapP2pBufferSize = 8U * 1024U * 1024U;
+    constexpr size_t kHeatmapHeaderSearchBytes = 512U;
+} // namespace
+
 class HikAlarmNode : public rclcpp::Node
 {
 public:
@@ -56,20 +135,27 @@ public:
         test_alarm_hold_seconds_ = declare_parameter<int>("test_alarm_hold_seconds", 1);
         thermometry_channel_ = declare_parameter<int>("thermometry_channel", 1);
         realtime_poll_interval_ms_ = declare_parameter<int>("realtime_poll_interval_ms", 1000);
+        heatmap_enable_ = declare_parameter<bool>("heatmap_enable", true);
+        heatmap_channel_ = declare_parameter<int>("heatmap_channel", 2);
+        heatmap_grid_rows_ = declare_parameter<int>("heatmap_grid_rows", 2);
+        heatmap_grid_cols_ = declare_parameter<int>("heatmap_grid_cols", 3);
         active_thermometry_channel_ = thermometry_channel_;
+        heatmap_grid_rows_ = std::max(1, heatmap_grid_rows_);
+        heatmap_grid_cols_ = std::max(1, heatmap_grid_cols_);
 
         const auto pkg_share = ament_index_cpp::get_package_share_directory("thermal_camera_monitor");
         save_pic_dir_ = resolve_save_dir(pkg_share, save_pic_dir_);
         std::filesystem::create_directories(save_pic_dir_);
 
         status_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticStatus>("/monitor/thermal_camera/status", 10);
+        heatmap_pub_ = create_publisher<sensor_msgs::msg::Image>("/monitor/thermal_camera/heatmap", 10);
         start_srv_ = create_service<std_srvs::srv::Trigger>("/monitor/thermal_camera/start", std::bind(&HikAlarmNode::on_start, this, std::placeholders::_1, std::placeholders::_2));
         stop_srv_ = create_service<std_srvs::srv::Trigger>("/monitor/thermal_camera/stop", std::bind(&HikAlarmNode::on_stop, this, std::placeholders::_1, std::placeholders::_2));
         test_alarm_srv_ = create_service<std_srvs::srv::Trigger>("/monitor/thermal_camera/test_alarm", std::bind(&HikAlarmNode::on_test_alarm, this, std::placeholders::_1, std::placeholders::_2));
 
         publish_status(diagnostic_msgs::msg::DiagnosticStatus::STALE, "热成像相机未启动");
-        RCLCPP_INFO(get_logger(), "热成像相机服务已就绪：start=/monitor/thermal_camera/start stop=/monitor/thermal_camera/stop status=/monitor/thermal_camera/status 地址=%s 图片目录=%s",
-                    device_ip_.c_str(), save_pic_dir_.c_str());
+        RCLCPP_INFO(get_logger(), "热成像相机服务已就绪：start=/monitor/thermal_camera/start stop=/monitor/thermal_camera/stop status=/monitor/thermal_camera/status 地址=%s 图片目录=%s 实时测温通道=%d 热力图通道=%d",
+                    device_ip_.c_str(), save_pic_dir_.c_str(), thermometry_channel_, heatmap_channel_);
     }
 
     ~HikAlarmNode() override
@@ -277,7 +363,6 @@ private:
         values.push_back(kv("login_mode", std::to_string(login_mode_)));
         values.push_back(kv("save_pic_dir", save_pic_dir_));
         values.push_back(kv("thermometry_channel", std::to_string(thermometry_channel_)));
-        values.push_back(kv("thermometry_channel", std::to_string(thermometry_channel_)));
         values.push_back(kv("alarm_active", latest_alarm_active_ ? "true" : "false"));
         values.push_back(kv("alarm_type", latest_alarm_type_));
         values.push_back(kv("alarm_detail", latest_alarm_detail_));
@@ -312,6 +397,27 @@ private:
             status.values = base_values_locked();
         }
         status_pub_->publish(status);
+    }
+
+    void publish_heatmap(const cv::Mat &image)
+    {
+        if (image.empty() || image.type() != CV_8UC3)
+            return;
+
+        cv::Mat contiguous = image;
+        if (!contiguous.isContinuous())
+            contiguous = image.clone();
+
+        sensor_msgs::msg::Image msg;
+        msg.header.stamp = now();
+        msg.height = static_cast<uint32_t>(contiguous.rows);
+        msg.width = static_cast<uint32_t>(contiguous.cols);
+        msg.encoding = "bgr8";
+        msg.is_bigendian = false;
+        msg.step = static_cast<sensor_msgs::msg::Image::_step_type>(contiguous.step);
+        const size_t data_size = contiguous.total() * contiguous.elemSize();
+        msg.data.assign(contiguous.datastart, contiguous.datastart + data_size);
+        heatmap_pub_->publish(msg);
     }
 
     std::string save_image_from_buffer(const std::vector<uint8_t> &data, const std::string &prefix)
@@ -645,6 +751,467 @@ private:
         realtime_calib_type_ = 2;
     }
 
+    static bool is_plausible_heatmap_header(const StreamFrameInfoTemp &frame_info,
+                                            size_t available_bytes,
+                                            uint64_t &sample_count,
+                                            uint32_t &sample_bytes,
+                                            std::string &reject_reason)
+    {
+        if (frame_info.rt_info.rt_data_type != 1 && frame_info.rt_info.rt_data_type != 2 && frame_info.rt_info.rt_data_type != 3)
+        {
+            reject_reason = "unsupported rt data type=" + std::to_string(frame_info.rt_info.rt_data_type);
+            return false;
+        }
+        if (frame_info.header_size < sizeof(StreamFrameInfoTemp) || frame_info.header_size > available_bytes)
+        {
+            reject_reason = "invalid header size=" + std::to_string(frame_info.header_size);
+            return false;
+        }
+        if (frame_info.rt_info.width == 0 || frame_info.rt_info.height == 0)
+        {
+            reject_reason = "invalid heatmap size";
+            return false;
+        }
+        if (frame_info.rt_info.width > 10000 || frame_info.rt_info.height > 10000)
+        {
+            reject_reason = "heatmap size too large";
+            return false;
+        }
+
+        sample_count = static_cast<uint64_t>(frame_info.rt_info.width) * static_cast<uint64_t>(frame_info.rt_info.height);
+        if (sample_count == 0 || sample_count > (64ULL * 1024ULL * 1024ULL))
+        {
+            reject_reason = "invalid sample count";
+            return false;
+        }
+
+        if (frame_info.supplementary.tm_data_mode == 0)
+            sample_bytes = 4U;
+        else if (frame_info.supplementary.tm_data_mode == 1)
+            sample_bytes = 2U;
+        else
+        {
+            reject_reason = "unsupported tm data mode=" + std::to_string(frame_info.supplementary.tm_data_mode);
+            return false;
+        }
+
+        if (frame_info.supplementary.tm_scale == 0)
+        {
+            reject_reason = "invalid tm scale=0";
+            return false;
+        }
+
+        const uint64_t required_size = static_cast<uint64_t>(frame_info.header_size) + sample_count * sample_bytes;
+        if (required_size > available_bytes)
+        {
+            reject_reason = "payload too short";
+            return false;
+        }
+
+        return true;
+    }
+
+    static bool infer_raw_float_heatmap_shape(size_t sample_count,
+                                              int jpeg_width,
+                                              int jpeg_height,
+                                              int &inferred_width,
+                                              int &inferred_height)
+    {
+        if (sample_count == 0)
+            return false;
+
+        const double target_aspect = (jpeg_width > 0 && jpeg_height > 0)
+                                         ? static_cast<double>(jpeg_width) / static_cast<double>(jpeg_height)
+                                         : 4.0 / 3.0;
+
+        double best_score = std::numeric_limits<double>::max();
+        int best_width = 0;
+        int best_height = 0;
+
+        for (size_t h = 1; h * h <= sample_count; ++h)
+        {
+            if (sample_count % h != 0)
+                continue;
+
+            const size_t w = sample_count / h;
+            const std::array<std::pair<int, int>, 2> candidates = {
+                std::make_pair(static_cast<int>(w), static_cast<int>(h)),
+                std::make_pair(static_cast<int>(h), static_cast<int>(w))};
+
+            for (const auto &candidate : candidates)
+            {
+                const int cw = candidate.first;
+                const int ch = candidate.second;
+                if (cw <= 0 || ch <= 0 || cw > 4096 || ch > 4096)
+                    continue;
+                if (cw < 16 || ch < 16)
+                    continue;
+
+                const double aspect = static_cast<double>(cw) / static_cast<double>(ch);
+                const double aspect_error = std::abs(aspect - target_aspect);
+                const double squareness_penalty = std::abs(std::log(aspect));
+                const double score = aspect_error + squareness_penalty * 0.05;
+                if (score < best_score)
+                {
+                    best_score = score;
+                    best_width = cw;
+                    best_height = ch;
+                }
+            }
+        }
+
+        if (best_width == 0 || best_height == 0)
+            return false;
+
+        inferred_width = best_width;
+        inferred_height = best_height;
+        return true;
+    }
+
+    bool parse_heatmap_frame(const std::vector<uint8_t> &raw_buffer,
+                             int jpeg_width,
+                             int jpeg_height,
+                             bool freeze_data,
+                             ParsedHeatmapFrame &frame,
+                             std::string &error_message)
+    {
+        frame = ParsedHeatmapFrame{};
+        if (raw_buffer.size() < sizeof(StreamFrameInfoTemp))
+            error_message = "p2p buffer too short for framed format";
+
+        const size_t search_limit = raw_buffer.size() >= sizeof(StreamFrameInfoTemp)
+                                        ? std::min(raw_buffer.size() - sizeof(StreamFrameInfoTemp), kHeatmapHeaderSearchBytes)
+                                        : 0;
+        const StreamFrameInfoTemp *frame_info = nullptr;
+        size_t header_offset = 0;
+        std::string last_reject_reason = "no candidate header";
+        uint64_t sample_count = 0;
+        uint32_t sample_bytes = 0;
+
+        for (size_t offset = 0; offset <= search_limit; ++offset)
+        {
+            const auto *candidate = reinterpret_cast<const StreamFrameInfoTemp *>(raw_buffer.data() + offset);
+            uint64_t candidate_sample_count = 0;
+            uint32_t candidate_sample_bytes = 0;
+            std::string reject_reason;
+            if (!is_plausible_heatmap_header(*candidate,
+                                             raw_buffer.size() - offset,
+                                             candidate_sample_count,
+                                             candidate_sample_bytes,
+                                             reject_reason))
+            {
+                last_reject_reason = reject_reason;
+                continue;
+            }
+
+            if (candidate->rt_info.rt_data_type != kFullScreenThermometryResultType)
+            {
+                last_reject_reason = "rt data type is not full-screen result, value=" + std::to_string(candidate->rt_info.rt_data_type);
+                continue;
+            }
+
+            frame_info = candidate;
+            header_offset = offset;
+            sample_count = candidate_sample_count;
+            sample_bytes = candidate_sample_bytes;
+            break;
+        }
+
+        if (frame_info == nullptr)
+        {
+            if (raw_buffer.size() % sizeof(float) != 0)
+            {
+                error_message = "unable to locate valid p2p frame header, preview=" +
+                                preview_hex(reinterpret_cast<const char *>(raw_buffer.data()), raw_buffer.size(), 32) +
+                                " reason=" + last_reject_reason;
+                return false;
+            }
+
+            const size_t sample_count_float = raw_buffer.size() / sizeof(float);
+            int inferred_width = 0;
+            int inferred_height = 0;
+            if (!infer_raw_float_heatmap_shape(sample_count_float, jpeg_width, jpeg_height, inferred_width, inferred_height))
+            {
+                error_message = "unable to infer raw float heatmap shape, samples=" + std::to_string(sample_count_float) +
+                                " preview=" + preview_hex(reinterpret_cast<const char *>(raw_buffer.data()), raw_buffer.size(), 32) +
+                                " reason=" + last_reject_reason;
+                return false;
+            }
+
+            frame.width = inferred_width;
+            frame.height = inferred_height;
+            frame.freeze_data = freeze_data;
+            frame.source_format = "raw_float";
+            frame.temperatures.resize(sample_count_float);
+
+            size_t plausible_count = 0;
+            for (size_t i = 0; i < sample_count_float; ++i)
+            {
+                float value = 0.0F;
+                std::memcpy(&value, raw_buffer.data() + i * sizeof(float), sizeof(float));
+                frame.temperatures[i] = value;
+                if (std::isfinite(value) && value > -100.0F && value < 1000.0F)
+                    ++plausible_count;
+            }
+
+            if (plausible_count < sample_count_float * 9 / 10)
+            {
+                error_message = "raw float heatmap values not plausible enough, samples=" + std::to_string(sample_count_float) +
+                                " preview=" + preview_hex(reinterpret_cast<const char *>(raw_buffer.data()), raw_buffer.size(), 32) +
+                                " reason=" + last_reject_reason;
+                return false;
+            }
+
+            return true;
+        }
+
+        const uint32_t header_size = frame_info->header_size;
+        frame.width = static_cast<int>(frame_info->rt_info.width);
+        frame.height = static_cast<int>(frame_info->rt_info.height);
+        frame.freeze_data = frame_info->supplementary.freeze_data != 0;
+        frame.source_format = "framed";
+        frame.temperatures.resize(static_cast<size_t>(sample_count));
+
+        const uint8_t *payload = raw_buffer.data() + header_offset + header_size;
+        const float offset = static_cast<float>(static_cast<int32_t>(frame_info->supplementary.tm_offset));
+        const uint32_t scale = frame_info->supplementary.tm_scale;
+        if (sample_bytes == 4U)
+        {
+            for (size_t i = 0; i < frame.temperatures.size(); ++i)
+            {
+                int32_t raw_value = 0;
+                std::memcpy(&raw_value, payload + i * sample_bytes, sizeof(raw_value));
+                frame.temperatures[i] = static_cast<float>(raw_value) / static_cast<float>(scale) + offset;
+            }
+        }
+        else
+        {
+            for (size_t i = 0; i < frame.temperatures.size(); ++i)
+            {
+                uint16_t raw_value = 0;
+                std::memcpy(&raw_value, payload + i * sample_bytes, sizeof(raw_value));
+                frame.temperatures[i] = static_cast<float>(raw_value) / static_cast<float>(scale) + offset;
+            }
+        }
+
+        return true;
+    }
+
+    bool capture_heatmap_frame(std::vector<uint8_t> &jpeg_buffer, ParsedHeatmapFrame &frame, std::string &error_message)
+    {
+        jpeg_buffer.clear();
+        frame = ParsedHeatmapFrame{};
+
+        std::vector<uint8_t> jpeg_storage(kHeatmapJpegBufferSize, 0);
+        std::vector<uint8_t> p2p_storage(kHeatmapP2pBufferSize, 0);
+
+        NET_DVR_JPEGPICTURE_WITH_APPENDDATA capture{};
+        capture.dwSize = sizeof(capture);
+        capture.dwChannel = static_cast<DWORD>(heatmap_channel_);
+        capture.pJpegPicBuff = reinterpret_cast<char *>(jpeg_storage.data());
+        capture.dwJpegPicLen = static_cast<DWORD>(jpeg_storage.size());
+        capture.pP2PDataBuff = reinterpret_cast<char *>(p2p_storage.data());
+        capture.dwP2PDataLen = static_cast<DWORD>(p2p_storage.size());
+
+        if (!NET_DVR_CaptureJPEGPicture_WithAppendData(user_id_, heatmap_channel_, &capture))
+        {
+            error_message = "capture jpeg with append data failed, error=" + std::to_string(NET_DVR_GetLastError());
+            return false;
+        }
+        if (capture.dwJpegPicLen == 0)
+        {
+            error_message = "jpeg buffer empty";
+            return false;
+        }
+        if (capture.dwP2PDataLen == 0)
+        {
+            error_message = "p2p temperature buffer empty";
+            return false;
+        }
+        if (capture.dwJpegPicLen > jpeg_storage.size() || capture.dwP2PDataLen > p2p_storage.size())
+        {
+            error_message = "captured buffer exceeds local storage";
+            return false;
+        }
+
+        jpeg_buffer.assign(jpeg_storage.begin(), jpeg_storage.begin() + capture.dwJpegPicLen);
+        std::vector<uint8_t> p2p_buffer(p2p_storage.begin(), p2p_storage.begin() + capture.dwP2PDataLen);
+        if (!parse_heatmap_frame(p2p_buffer,
+                                 static_cast<int>(capture.dwJpegPicWidth),
+                                 static_cast<int>(capture.dwJpegPicHeight),
+                                 capture.byIsFreezedata != 0,
+                                 frame,
+                                 error_message))
+            return false;
+
+        const bool should_log_dimensions = !heatmap_dimensions_logged_ ||
+                                           last_heatmap_jpeg_width_ != static_cast<int>(capture.dwJpegPicWidth) ||
+                                           last_heatmap_jpeg_height_ != static_cast<int>(capture.dwJpegPicHeight) ||
+                                           last_heatmap_frame_width_ != frame.width ||
+                                           last_heatmap_frame_height_ != frame.height ||
+                                           last_heatmap_source_format_ != frame.source_format;
+        if (should_log_dimensions)
+        {
+            heatmap_dimensions_logged_ = true;
+            last_heatmap_jpeg_width_ = static_cast<int>(capture.dwJpegPicWidth);
+            last_heatmap_jpeg_height_ = static_cast<int>(capture.dwJpegPicHeight);
+            last_heatmap_frame_width_ = frame.width;
+            last_heatmap_frame_height_ = frame.height;
+            last_heatmap_source_format_ = frame.source_format;
+            RCLCPP_INFO(get_logger(),
+                        "[海康] 热力图抓图成功：channel=%d sdk_jpeg=%ux%u p2p_len=%u frame=%dx%d format=%s freeze=%s",
+                        heatmap_channel_,
+                        capture.dwJpegPicWidth,
+                        capture.dwJpegPicHeight,
+                        capture.dwP2PDataLen,
+                        frame.width,
+                        frame.height,
+                        frame.source_format.c_str(),
+                        frame.freeze_data ? "true" : "false");
+        }
+
+        return true;
+    }
+
+    std::vector<TemperatureGridStats> compute_heatmap_grid(const ParsedHeatmapFrame &frame) const
+    {
+        std::vector<TemperatureGridStats> grid;
+        grid.reserve(static_cast<size_t>(heatmap_grid_rows_ * heatmap_grid_cols_));
+
+        for (int row = 0; row < heatmap_grid_rows_; ++row)
+        {
+            const int y0 = row * frame.height / heatmap_grid_rows_;
+            const int y1 = (row + 1) * frame.height / heatmap_grid_rows_;
+            for (int col = 0; col < heatmap_grid_cols_; ++col)
+            {
+                const int x0 = col * frame.width / heatmap_grid_cols_;
+                const int x1 = (col + 1) * frame.width / heatmap_grid_cols_;
+
+                float min_temperature = std::numeric_limits<float>::max();
+                float max_temperature = std::numeric_limits<float>::lowest();
+                float sum_temperature = 0.0F;
+                size_t count = 0;
+
+                for (int y = y0; y < y1; ++y)
+                {
+                    for (int x = x0; x < x1; ++x)
+                    {
+                        const float value = frame.temperatures[static_cast<size_t>(y * frame.width + x)];
+                        min_temperature = std::min(min_temperature, value);
+                        max_temperature = std::max(max_temperature, value);
+                        sum_temperature += value;
+                        ++count;
+                    }
+                }
+
+                TemperatureGridStats stats;
+                if (count > 0)
+                {
+                    stats.min_temperature = min_temperature;
+                    stats.max_temperature = max_temperature;
+                    stats.avg_temperature = sum_temperature / static_cast<float>(count);
+                }
+                grid.push_back(stats);
+            }
+        }
+
+        return grid;
+    }
+
+    cv::Mat render_heatmap_overlay(const std::vector<uint8_t> &jpeg_buffer,
+                                   const ParsedHeatmapFrame &frame,
+                                   const std::vector<TemperatureGridStats> &grid,
+                                   std::string &error_message) const
+    {
+        cv::Mat decoded = cv::imdecode(jpeg_buffer, cv::IMREAD_COLOR);
+        if (decoded.empty())
+        {
+            error_message = "failed to decode thermal jpeg";
+            return {};
+        }
+
+        const double scale_x = static_cast<double>(decoded.cols) / static_cast<double>(frame.width);
+        const double scale_y = static_cast<double>(decoded.rows) / static_cast<double>(frame.height);
+        const int cell_count = heatmap_grid_rows_ * heatmap_grid_cols_;
+        if (static_cast<int>(grid.size()) != cell_count)
+        {
+            error_message = "heatmap grid size mismatch";
+            return {};
+        }
+
+        const double cell_width = static_cast<double>(decoded.cols) / static_cast<double>(heatmap_grid_cols_);
+        const double cell_height = static_cast<double>(decoded.rows) / static_cast<double>(heatmap_grid_rows_);
+        const double font_scale_from_cell = std::min(cell_width / 140.0, cell_height / 85.0);
+        const double font_scale = std::clamp(font_scale_from_cell, 0.18, 0.32);
+        const int thickness = 1;
+        const cv::Scalar line_color(0, 255, 255);
+        const cv::Scalar text_color(255, 255, 255);
+        const cv::Scalar shadow_color(0, 0, 0);
+
+        for (int row = 0; row < heatmap_grid_rows_; ++row)
+        {
+            const int src_y0 = row * frame.height / heatmap_grid_rows_;
+            const int src_y1 = (row + 1) * frame.height / heatmap_grid_rows_;
+            const int dst_y0 = std::clamp(static_cast<int>(std::round(src_y0 * scale_y)), 0, decoded.rows - 1);
+            const int dst_y1 = std::clamp(static_cast<int>(std::round(src_y1 * scale_y)), dst_y0 + 1, decoded.rows);
+
+            for (int col = 0; col < heatmap_grid_cols_; ++col)
+            {
+                const int index = row * heatmap_grid_cols_ + col;
+                const int src_x0 = col * frame.width / heatmap_grid_cols_;
+                const int src_x1 = (col + 1) * frame.width / heatmap_grid_cols_;
+                const int dst_x0 = std::clamp(static_cast<int>(std::round(src_x0 * scale_x)), 0, decoded.cols - 1);
+                const int dst_x1 = std::clamp(static_cast<int>(std::round(src_x1 * scale_x)), dst_x0 + 1, decoded.cols);
+
+                cv::rectangle(decoded, cv::Point(dst_x0, dst_y0), cv::Point(dst_x1 - 1, dst_y1 - 1), line_color, 1);
+
+                const std::array<std::string, 3> labels = {
+                    "AVG " + number(grid[static_cast<size_t>(index)].avg_temperature),
+                    "MAX " + number(grid[static_cast<size_t>(index)].max_temperature),
+                    "MIN " + number(grid[static_cast<size_t>(index)].min_temperature)};
+
+                const int top_padding = 3;
+                const int left_padding = 2;
+                const int baseline_step = std::max(8, static_cast<int>(std::round(cell_height / 5.0)));
+                int text_y = std::min(dst_y0 + top_padding + baseline_step, decoded.rows - 4);
+                const int text_x = std::min(dst_x0 + left_padding, std::max(0, decoded.cols - 1));
+                for (const auto &label : labels)
+                {
+                    cv::putText(decoded, label, cv::Point(text_x + 1, text_y + 1), cv::FONT_HERSHEY_SIMPLEX, font_scale, shadow_color, thickness + 1, cv::LINE_AA);
+                    cv::putText(decoded, label, cv::Point(text_x, text_y), cv::FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness, cv::LINE_AA);
+                    text_y = std::min(text_y + baseline_step, decoded.rows - 6);
+                }
+            }
+        }
+
+        return decoded;
+    }
+
+    void try_publish_heatmap()
+    {
+        if (!heatmap_enable_)
+            return;
+
+        std::vector<uint8_t> jpeg_buffer;
+        ParsedHeatmapFrame frame;
+        std::string error_message;
+        if (!capture_heatmap_frame(jpeg_buffer, frame, error_message))
+        {
+            RCLCPP_WARN(get_logger(), "[海康] 热力分布图抓取失败：channel=%d error=%s", heatmap_channel_, error_message.c_str());
+            return;
+        }
+
+        const auto grid = compute_heatmap_grid(frame);
+        cv::Mat rendered = render_heatmap_overlay(jpeg_buffer, frame, grid, error_message);
+        if (rendered.empty())
+        {
+            RCLCPP_WARN(get_logger(), "[海康] 热力分布图渲染失败：channel=%d error=%s", heatmap_channel_, error_message.c_str());
+            return;
+        }
+
+        publish_heatmap(rendered);
+    }
+
     bool fetch_rule_temperature_info(int channel, NET_DVR_THERMOMETRYRULE_TEMPERATURE_INFO &temperature_info, std::string &error_message)
     {
         DWORD bytes_returned = 0;
@@ -817,6 +1384,7 @@ private:
                     get_logger(),
                     "[海康] 实时测温：channel=%d rule_id=%u rule_name=%s 平均=%.1f°C 最高=%.1f°C 最低=%.1f°C 温差=%.1f°C",
                     active_channel, rule_id, rule_name.c_str(), avg_temperature, max_temperature, min_temperature, temperature_diff);
+                try_publish_heatmap();
             }
 
             bool alarm_active = false;
@@ -879,13 +1447,24 @@ private:
     int test_alarm_hold_seconds_{};
     int thermometry_channel_{};
     int realtime_poll_interval_ms_{};
+    bool heatmap_enable_{true};
+    int heatmap_channel_{2};
+    int heatmap_grid_rows_{2};
+    int heatmap_grid_cols_{3};
     int active_thermometry_channel_{1};
+    bool heatmap_dimensions_logged_{false};
+    int last_heatmap_jpeg_width_{0};
+    int last_heatmap_jpeg_height_{0};
+    int last_heatmap_frame_width_{0};
+    int last_heatmap_frame_height_{0};
+    std::string last_heatmap_source_format_;
 
     std::atomic<bool> monitoring_active_{false};
     std::thread worker_;
     std::mutex thread_mutex_;
     std::mutex status_mutex_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr heatmap_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr test_alarm_srv_;

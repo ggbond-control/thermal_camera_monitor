@@ -12,13 +12,17 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
 set(HIK_SDK_ROOT_ARM "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hik_sdk/arm64")
 set(HIK_SDK_ROOT_X64 "${CMAKE_CURRENT_SOURCE_DIR}/third_party/hik_sdk/x64")
 
 add_executable(hik_alarm_node src/hik_alarm_node.cpp)
-ament_target_dependencies(hik_alarm_node rclcpp ament_index_cpp diagnostic_msgs std_srvs)
+ament_target_dependencies(hik_alarm_node rclcpp ament_index_cpp diagnostic_msgs sensor_msgs std_srvs)
+target_link_libraries(hik_alarm_node ${OpenCV_LIBS})
+target_include_directories(hik_alarm_node PRIVATE ${OpenCV_INCLUDE_DIRS})
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   set(HIK_SDK_INC_DIR "${HIK_SDK_ROOT_ARM}/include")

@@ -10,3 +10,7 @@ hik_alarm_node:
     save_pic_dir: "alarms"
     thermometry_channel: 1
     realtime_poll_interval_ms: 1000
+    heatmap_enable: true
+    heatmap_channel: 2
+    heatmap_grid_rows: 2
+    heatmap_grid_cols: 3
