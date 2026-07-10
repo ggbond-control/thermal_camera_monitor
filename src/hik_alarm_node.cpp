@@ -267,6 +267,18 @@ private:
         return oss.str();
     }
 
+    static std::string number_array_json(const std::vector<float> &values)
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            if (i)
+                oss << ",";
+            oss << std::fixed << std::setprecision(2) << values[i];
+        }
+        return oss.str();
+    }
+
     static std::string preview_hex(const char *data, size_t length, size_t max_bytes = 16)
     {
         if (data == nullptr || length == 0)
@@ -330,6 +342,9 @@ private:
         realtime_rule_id_ = 0;
         realtime_calib_type_ = 2;
         realtime_error_.clear();
+        region_avg_temperatures_c_.clear();
+        region_max_temperatures_c_.clear();
+        region_min_temperatures_c_.clear();
         active_thermometry_channel_ = thermometry_channel_;
         manual_test_alarm_until_ = std::chrono::steady_clock::time_point{};
     }
@@ -376,6 +391,12 @@ private:
         values.push_back(kv("realtime_rule_name", realtime_rule_name_));
         values.push_back(kv("realtime_rule_id", std::to_string(realtime_rule_id_)));
         values.push_back(kv("realtime_calib_type", std::to_string(realtime_calib_type_)));
+        values.push_back(kv("region_temperature_rows", std::to_string(heatmap_grid_rows_)));
+        values.push_back(kv("region_temperature_cols", std::to_string(heatmap_grid_cols_)));
+        values.push_back(kv("region_temperature_count", std::to_string(heatmap_grid_rows_ * heatmap_grid_cols_)));
+        values.push_back(kv("region_avg_temperature_c", number_array_json(region_avg_temperatures_c_)));
+        values.push_back(kv("region_max_temperature_c", number_array_json(region_max_temperatures_c_)));
+        values.push_back(kv("region_min_temperature_c", number_array_json(region_min_temperatures_c_)));
         values.push_back(kv("artifact_count", std::to_string(latest_artifacts_.size())));
         for (size_t i = 0; i < latest_artifacts_.size(); ++i)
             values.push_back(kv("artifact_path_" + std::to_string(i), latest_artifacts_[i]));
@@ -1118,6 +1139,36 @@ private:
         return grid;
     }
 
+    void update_region_thermometry_status(const std::vector<TemperatureGridStats> &grid)
+    {
+        std::vector<float> avg_values;
+        std::vector<float> max_values;
+        std::vector<float> min_values;
+        avg_values.reserve(grid.size());
+        max_values.reserve(grid.size());
+        min_values.reserve(grid.size());
+
+        for (const auto &cell : grid)
+        {
+            avg_values.push_back(cell.avg_temperature);
+            max_values.push_back(cell.max_temperature);
+            min_values.push_back(cell.min_temperature);
+        }
+
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        region_avg_temperatures_c_ = std::move(avg_values);
+        region_max_temperatures_c_ = std::move(max_values);
+        region_min_temperatures_c_ = std::move(min_values);
+    }
+
+    void clear_region_thermometry_status()
+    {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        region_avg_temperatures_c_.clear();
+        region_max_temperatures_c_.clear();
+        region_min_temperatures_c_.clear();
+    }
+
     cv::Mat render_heatmap_overlay(const std::vector<uint8_t> &jpeg_buffer,
                                    const ParsedHeatmapFrame &frame,
                                    const std::vector<TemperatureGridStats> &grid,
@@ -1187,21 +1238,23 @@ private:
         return decoded;
     }
 
-    void try_publish_heatmap()
+    void update_region_thermometry_and_optional_heatmap()
     {
-        if (!heatmap_enable_)
-            return;
-
         std::vector<uint8_t> jpeg_buffer;
         ParsedHeatmapFrame frame;
         std::string error_message;
         if (!capture_heatmap_frame(jpeg_buffer, frame, error_message))
         {
+            clear_region_thermometry_status();
             RCLCPP_WARN(get_logger(), "[海康] 热力分布图抓取失败：channel=%d error=%s", heatmap_channel_, error_message.c_str());
             return;
         }
 
         const auto grid = compute_heatmap_grid(frame);
+        update_region_thermometry_status(grid);
+        if (!heatmap_enable_)
+            return;
+
         cv::Mat rendered = render_heatmap_overlay(jpeg_buffer, frame, grid, error_message);
         if (rendered.empty())
         {
@@ -1384,7 +1437,7 @@ private:
                     get_logger(),
                     "[海康] 实时测温：channel=%d rule_id=%u rule_name=%s 平均=%.1f°C 最高=%.1f°C 最低=%.1f°C 温差=%.1f°C",
                     active_channel, rule_id, rule_name.c_str(), avg_temperature, max_temperature, min_temperature, temperature_diff);
-                try_publish_heatmap();
+                update_region_thermometry_and_optional_heatmap();
             }
 
             bool alarm_active = false;
@@ -1485,6 +1538,9 @@ private:
     std::string realtime_error_;
     uint8_t realtime_rule_id_{0};
     uint8_t realtime_calib_type_{2};
+    std::vector<float> region_avg_temperatures_c_;
+    std::vector<float> region_max_temperatures_c_;
+    std::vector<float> region_min_temperatures_c_;
     std::chrono::steady_clock::time_point manual_test_alarm_until_{};
 
 #ifdef USE_HIK_SDK
